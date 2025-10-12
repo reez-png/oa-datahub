@@ -1,3 +1,5 @@
+version: "3.8"
+
 services:
   db:
     image: postgres:16
@@ -17,17 +19,19 @@ services:
 
   api:
     build: ./app/api
-    # Explicitly set PYTHONPATH in case your Dockerfile changes later
     environment:
       - APP_VERSION=0.1.0
       - PYTHONPATH=/app/src
       - DATABASE_URL=postgresql+psycopg://appuser:apppass@db:5432/oadb
+      - DATA_DIR=/app/data/raw            # NEW: your app can read/write here
     depends_on:
       db:
         condition: service_healthy
     ports:
       - "8000:8000"
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    volumes:
+      - ./data:/app/data                  # NEW: host ./data ↔ container /app/data
 
 volumes:
   dbdata:

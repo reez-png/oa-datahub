@@ -3,3 +3,6 @@ uvicorn[standard]==0.30.6
 pydantic==2.9.2
 sqlmodel==0.0.16
 psycopg[binary]==3.2.1
+python-multipart==0.0.9
+pandas==2.2.2
+chardet==5.2.0
