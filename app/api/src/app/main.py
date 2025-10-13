@@ -1,19 +1,23 @@
 # app/api/src/app/main.py
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
-from fastapi.responses import StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
+from typing import List, Optional
+
 import os, io, csv
 import chardet
 import pandas as pd
 import numpy as np
-import matplotlib as mpl
-mpl.use("Agg")  # non-interactive backend for servers
-import matplotlib.pyplot as plt
 
-from sqlmodel import SQLModel, Field, select, Session
-from typing import List, Optional
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, FileResponse
+
+from sqlmodel import SQLModel, Field, Session, select
 from datetime import date
+
+# Matplotlib (server-safe backend)
+import matplotlib as mpl
+mpl.use("Agg")
+import matplotlib.pyplot as plt
 
 # RQ + Redis
 from redis import Redis
@@ -92,7 +96,8 @@ def _detect_encoding(sample: bytes) -> str:
 
 def _detect_delimiter(text_sample: str) -> str:
     try:
-        dialect = csv.Sniffer().sniff(text_sample, delimiters=";,|\t")
+        sniffer = csv.Sniffer()
+        dialect = sniffer.sniff(text_sample, delimiters=";,|\t,")
         return dialect.delimiter
     except Exception:
         return ","
@@ -104,7 +109,26 @@ def _read_csv_head(path: Path, nrows: int = 50) -> pd.DataFrame:
     delim = _detect_delimiter(text)
     return pd.read_csv(path, nrows=nrows, encoding=enc, sep=delim)
 
-# --- alias mapper & sampled reader (used by geojson) ---
+def _read_csv_full(path: Path) -> pd.DataFrame:
+    raw = path.read_bytes()[:400_000]
+    enc = _detect_encoding(raw)
+    text = raw.decode(enc, errors="replace")
+    delim = _detect_delimiter(text)
+    return pd.read_csv(path, encoding=enc, sep=delim)
+
+def _df_schema(df: pd.DataFrame) -> list[dict]:
+    nn = df.notna().sum()
+    return [{"name": c, "dtype": str(df[c].dtype), "non_null": int(nn[c])} for c in df.columns]
+
+def _read_csv_sample(path: Path, max_rows: int = 5000) -> pd.DataFrame:
+    """Read a moderate, bounded sample with sniffed encoding/delimiter."""
+    raw = path.read_bytes()[:400_000]
+    enc = _detect_encoding(raw)
+    text = raw.decode(enc, errors="replace")
+    delim = _detect_delimiter(text)
+    return pd.read_csv(path, nrows=max_rows, encoding=enc, sep=delim)
+
+# --- alias mapper (used by geojson) ---
 CANONICAL = {
     "time": ["time", "date", "datetime", "timestamp", "sample_time"],
     "latitude": ["latitude", "lat"],
@@ -121,14 +145,6 @@ def _normalize_columns(df: pd.DataFrame) -> dict:
                 mapping[canon] = lower[a.lower()]
                 break
     return mapping
-
-def _read_csv_sample(path: Path, max_rows: int = 5000) -> pd.DataFrame:
-    """Read a moderate, bounded sample with sniffed encoding/delimiter."""
-    raw = path.read_bytes()[:400_000]
-    enc = _detect_encoding(raw)
-    text = raw.decode(enc, errors="replace")
-    delim = _detect_delimiter(text)
-    return pd.read_csv(path, nrows=max_rows, encoding=enc, sep=delim)
 
 # ---------- Dataset Endpoints ----------
 @app.get("/datasets", response_model=List[DatasetRead])
@@ -157,7 +173,7 @@ def delete_dataset(dataset_id: int, session: Session = Depends(get_session)):
         session.delete(item)
         session.commit()
 
-# ---------- File Upload ----------
+# ---------- File Upload + List ----------
 @app.post("/datasets/{dataset_id}/files", response_model=dict, status_code=201)
 async def upload_file(dataset_id: int, f: UploadFile = File(...), session: Session = Depends(get_session)):
     ds = session.get(Dataset, dataset_id)
@@ -189,6 +205,54 @@ async def upload_file(dataset_id: int, f: UploadFile = File(...), session: Sessi
         "stored_path": rec.stored_path,
         "bytes": rec.bytes,
         "tip": "Saved under data/raw/<dataset_id>/ on your host.",
+    }
+
+# >>>>>>> ADDED: list files endpoint <<<<<<<
+@app.get("/datasets/{dataset_id}/files", response_model=list[dict])
+def list_dataset_files(dataset_id: int, session: Session = Depends(get_session)):
+    rows = session.exec(select(FileRecord).where(FileRecord.dataset_id == dataset_id)).all()
+    return [
+        {
+            "file_id": r.id,
+            "dataset_id": r.dataset_id,
+            "original_name": r.original_name,
+            "stored_path": r.stored_path,
+            "bytes": r.bytes,
+        }
+        for r in rows
+    ]
+
+# ---------- Preview Endpoint ----------
+@app.get("/datasets/{dataset_id}/preview", response_model=dict)
+def preview_dataset(
+    dataset_id: int,
+    file_id: int | None = None,
+    nrows: int = 50,
+    session: Session = Depends(get_session),
+):
+    q = select(FileRecord).where(FileRecord.dataset_id == dataset_id)
+    q = q.where(FileRecord.id == file_id) if file_id is not None else q.order_by(FileRecord.id.desc())
+    rec = session.exec(q).first()
+    if not rec:
+        raise HTTPException(status_code=404, detail="No files found for this dataset")
+
+    path = Path("/app") / rec.stored_path
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"File not found on disk: {rec.stored_path}")
+
+    try:
+        df = _read_csv_head(path, nrows=max(1, min(nrows, 200)))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read CSV: {e}")
+
+    sample = df.head(min(len(df), nrows)).fillna("").astype(str).to_dict(orient="records")
+    return {
+        "file_id": rec.id,
+        "stored_path": rec.stored_path,
+        "rows_previewed": len(sample),
+        "columns": _df_schema(df),
+        "data": sample,
+        "note": "Preview reads only the first chunk and infers delimiter/encoding.",
     }
 
 # ---------- Jobs (enqueue + status) ----------
@@ -236,6 +300,127 @@ def get_job(job_id: str, session: Session = Depends(get_session)):
             "type": getattr(db_job, "type", None) if db_job else None,
         },
     }
+
+# ---------- Job logs & result download ----------
+@app.get("/jobs/{job_id}/logs", response_class=StreamingResponse)
+def job_logs(job_id: str):
+    # Matches tasks.py LOG_DIR = /app/data/processed/logs
+    log_path = Path("/app") / "data" / "processed" / "logs" / f"{job_id}.log"
+    if not log_path.exists():
+        # No logs yet → return empty text/plain stream
+        return StreamingResponse(iter([""]), media_type="text/plain")
+    return StreamingResponse(log_path.open("rb"), media_type="text/plain")
+
+@app.get("/jobs/{job_id}/result")
+def job_result(job_id: str, session: Session = Depends(get_session)):
+    db_job = session.get(Job, job_id)
+    if not db_job or not db_job.result_path:
+        raise HTTPException(status_code=404, detail="Result not available")
+    p = Path("/app") / db_job.result_path
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="Result file missing on disk")
+    return FileResponse(p, media_type="text/csv", filename=p.name)
+
+# ---------- Time series PNG (generic y vs time) ----------
+@app.get("/datasets/{dataset_id}/timeseries")
+def plot_timeseries(
+    dataset_id: int,
+    y: str,
+    time_col: str = "time",
+    file_id: int | None = None,
+    resample: str | None = None,
+    session: Session = Depends(get_session),
+):
+    q = select(FileRecord).where(FileRecord.dataset_id == dataset_id)
+    q = q.where(FileRecord.id == file_id) if file_id is not None else q.order_by(FileRecord.id.desc())
+    rec = session.exec(q).first()
+    if not rec:
+        raise HTTPException(status_code=404, detail="No files found for this dataset")
+
+    path = Path("/app") / rec.stored_path
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"File not found on disk: {rec.stored_path}")
+
+    try:
+        df = _read_csv_full(path)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read CSV: {e}")
+
+    if time_col not in df.columns:
+        raise HTTPException(status_code=400, detail=f"Time column '{time_col}' not found.")
+    if y not in df.columns:
+        raise HTTPException(status_code=400, detail=f"Y column '{y}' not found.")
+
+    t = pd.to_datetime(df[time_col], errors="coerce", utc=True)
+    s = pd.to_numeric(df[y], errors="coerce")
+    sel = ~(t.isna() | s.isna())
+    ts = pd.DataFrame({"t": t[sel], "y": s[sel]}).sort_values("t").set_index("t")
+    if ts.empty:
+        raise HTTPException(status_code=400, detail="No valid (time, value) rows to plot.")
+
+    if resample:
+        try:
+            ts = ts.resample(resample).mean()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid resample rule (try 'D' or 'M').")
+
+    fig, ax = plt.subplots(figsize=(6, 3))
+    ax.plot(ts.index, ts["y"])
+    ax.set_xlabel(time_col)
+    ax.set_ylabel(y)
+    ax.set_title(f"{y} vs {time_col}")
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="image/png")
+
+# ---------- CSV export ----------
+@app.get("/datasets/{dataset_id}/export")
+def export_dataset_csv(
+    dataset_id: int,
+    file_id: int | None = None,
+    columns: str | None = None,
+    limit: int | None = None,
+    session: Session = Depends(get_session),
+):
+    q = select(FileRecord).where(FileRecord.dataset_id == dataset_id)
+    q = q.where(FileRecord.id == file_id) if file_id is not None else q.order_by(FileRecord.id.desc())
+    rec = session.exec(q).first()
+    if not rec:
+        raise HTTPException(status_code=404, detail="No files found for this dataset")
+
+    path = Path("/app") / rec.stored_path
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"File not found on disk: {rec.stored_path}")
+
+    try:
+        df = _read_csv_full(path)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read CSV: {e}")
+
+    if columns:
+        keep = [c.strip() for c in columns.split(",") if c.strip()]
+        missing = [c for c in keep if c not in df.columns]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Columns not found: {missing}")
+        df = df[keep]
+
+    if limit is not None:
+        try:
+            n = max(1, int(limit))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="limit must be an integer")
+        df = df.head(n)
+
+    def _iter():
+        yield df.to_csv(index=False)
+
+    filename = Path(rec.original_name).with_suffix(".filtered.csv").name
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(_iter(), media_type="text/csv", headers=headers)
 
 # ---------- Geo preview (GeoJSON) ----------
 def _pick_col(mapping: dict, explicit: Optional[str], key: str) -> str:
