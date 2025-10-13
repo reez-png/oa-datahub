@@ -5,6 +5,7 @@ from pathlib import Path
 import os, io, csv
 import chardet
 import pandas as pd
+import numpy as np
 import matplotlib as mpl
 mpl.use("Agg")  # non-interactive backend for servers
 import matplotlib.pyplot as plt
@@ -64,7 +65,7 @@ class FileRecord(SQLModel, table=True):
 
 # ---------- Helpers ----------
 def _get_queue() -> Queue:
-    # per your note: default to localhost unless REDIS_URL provided
+    # Default to localhost unless REDIS_URL provided
     url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     conn = Redis.from_url(url)
     return Queue("default", connection=conn)
@@ -91,6 +92,32 @@ def _read_csv_head(path: Path, nrows: int = 50) -> pd.DataFrame:
     text = raw.decode(enc, errors="replace")
     delim = _detect_delimiter(text)
     return pd.read_csv(path, nrows=nrows, encoding=enc, sep=delim)
+
+# --- alias mapper & sampled reader (used by geojson) ---
+CANONICAL = {
+    "time": ["time", "date", "datetime", "timestamp", "sample_time"],
+    "latitude": ["latitude", "lat"],
+    "longitude": ["longitude", "lon", "long", "lng"],
+}
+
+def _normalize_columns(df: pd.DataFrame) -> dict:
+    """Map canonical names -> actual column names in df (best-effort)."""
+    lower = {c.lower(): c for c in df.columns}
+    mapping = {}
+    for canon, alts in CANONICAL.items():
+        for a in alts:
+            if a.lower() in lower:
+                mapping[canon] = lower[a.lower()]
+                break
+    return mapping
+
+def _read_csv_sample(path: Path, max_rows: int = 5000) -> pd.DataFrame:
+    """Read a moderate, bounded sample with sniffed encoding/delimiter."""
+    raw = path.read_bytes()[:400_000]
+    enc = _detect_encoding(raw)
+    text = raw.decode(enc, errors="replace")
+    delim = _detect_delimiter(text)
+    return pd.read_csv(path, nrows=max_rows, encoding=enc, sep=delim)
 
 # ---------- Dataset Endpoints ----------
 @app.get("/datasets", response_model=List[DatasetRead])
@@ -198,3 +225,102 @@ def get_job(job_id: str, session: Session = Depends(get_session)):
             "type": getattr(db_job, "type", None) if db_job else None,
         },
     }
+
+# ---------- Geo preview (GeoJSON) ----------
+def _pick_col(mapping: dict, explicit: Optional[str], key: str) -> str:
+    if explicit:
+        return explicit
+    if key not in mapping:
+        raise HTTPException(status_code=400, detail=f"Column for '{key}' not found and no alias provided.")
+    return mapping[key]
+
+@app.get("/datasets/{dataset_id}/geojson", response_model=dict)
+def dataset_geojson(
+    dataset_id: int,
+    file_id: Optional[int] = None,
+    lat_col: Optional[str] = None,
+    lon_col: Optional[str] = None,
+    time_col: Optional[str] = None,
+    value_cols: Optional[str] = None,   # comma-separated list to include as properties
+    limit: int = 5000,
+    bbox: Optional[str] = None,         # "minLon,minLat,maxLon,maxLat"
+    session: Session = Depends(get_session),
+):
+    # choose file (latest if not specified)
+    q = select(FileRecord).where(FileRecord.dataset_id == dataset_id)
+    q = q.where(FileRecord.id == file_id) if file_id is not None else q.order_by(FileRecord.id.desc())
+    rec = session.exec(q).first()
+    if not rec:
+        raise HTTPException(status_code=404, detail="No files found for this dataset")
+
+    path = Path("/app") / rec.stored_path
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"File not found on disk: {rec.stored_path}")
+
+    try:
+        df = _read_csv_sample(path, max_rows=max(1000, min(limit * 5, 50000)))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read CSV: {e}")
+
+    # map canonical aliases (from earlier helpers)
+    mapping = _normalize_columns(df)
+
+    # decide columns to use
+    lat_name = lat_col or mapping.get("latitude")
+    lon_name = lon_col or mapping.get("longitude")
+    if not lat_name or not lon_name:
+        raise HTTPException(status_code=400, detail="Latitude/Longitude columns not found. Provide lat_col/lon_col or rename columns.")
+
+    t_name = time_col or mapping.get("time")
+
+    # numeric conversions + validity mask
+    lat = pd.to_numeric(df[lat_name], errors="coerce")
+    lon = pd.to_numeric(df[lon_name], errors="coerce")
+    mask = ~(lat.isna() | lon.isna() | (lat < -90) | (lat > 90) | (lon < -180) | (lon > 180))
+
+    # optional bbox filter
+    if bbox:
+        try:
+            mnL, mnA, mxL, mxA = [float(x) for x in bbox.split(",")]
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid bbox. Use 'minLon,minLat,maxLon,maxLat'.")
+        mask &= (lon >= mnL) & (lon <= mxL) & (lat >= mnA) & (lat <= mxA)
+
+    d = df.loc[mask].copy()
+    if d.empty:
+        return {"type": "FeatureCollection", "features": []}
+
+    # choose value columns to include in properties
+    props_cols: List[str] = []
+    if value_cols:
+        for c in [c.strip() for c in value_cols.split(",") if c.strip()]:
+            if c in d.columns:
+                props_cols.append(c)
+
+    # time column (optional)
+    if t_name and t_name in d.columns:
+        t_ser = pd.to_datetime(d[t_name], errors="coerce", utc=True)
+    else:
+        t_ser = None
+
+    # build features (cap by limit for responsiveness)
+    feats = []
+    for i, row in d.head(limit).iterrows():
+        props: dict = {}
+        if t_ser is not None:
+            ts = t_ser.loc[i]
+            if pd.notna(ts):
+                props["time"] = ts.isoformat()
+        for c in props_cols:
+            val = row[c]
+            if pd.isna(val):
+                continue
+            props[c] = float(val) if isinstance(val, (int, float, np.number)) else str(val)
+
+        feats.append({
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [float(row[lon_name]), float(row[lat_name])]},
+            "properties": props
+        })
+
+    return {"type": "FeatureCollection", "features": feats}
