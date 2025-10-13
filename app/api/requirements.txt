@@ -6,3 +6,4 @@ psycopg[binary]==3.2.1
 python-multipart==0.0.9
 pandas==2.2.2
 chardet==5.2.0
+matplotlib==3.9.2

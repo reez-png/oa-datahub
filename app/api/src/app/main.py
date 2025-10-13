@@ -1,15 +1,20 @@
 # app/api/src/app/main.py
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi.responses import StreamingResponse, Response
 from pathlib import Path
 import os
 from typing import List, Optional
 from datetime import date
 from sqlmodel import SQLModel, Field, select, Session
 
-# --- CSV/preview/validation imports ---
+# --- CSV/preview/validation/plotting imports ---
+import io
 import csv
 import chardet
 import pandas as pd
+import matplotlib as mpl
+mpl.use("Agg")  # non-interactive backend for servers
+import matplotlib.pyplot as plt
 
 from app.db import create_db_and_tables, get_session
 
@@ -346,3 +351,121 @@ def validate_dataset(
         "bad_rows_sample": sample_bad,
         "note": "Validation uses a sampled read; fix columns/units then re-upload for best results."
     }
+
+# ---------- Full-read helper (used by /timeseries and /export) ----------
+
+def _read_csv_full(path: Path) -> pd.DataFrame:
+    raw = path.read_bytes()[:400_000]
+    enc = _detect_encoding(raw)
+    text = raw.decode(enc, errors="replace")
+    delim = _detect_delimiter(text)
+    return pd.read_csv(path, encoding=enc, sep=delim)
+
+# ---------- Time-series plot (PNG) ----------
+
+@app.get("/datasets/{dataset_id}/timeseries")
+def plot_timeseries(
+    dataset_id: int,
+    y: str,                     # e.g., "temperature"
+    time_col: str = "time",
+    file_id: Optional[int] = None,
+    resample: Optional[str] = None,  # e.g., "D" (daily), "M" (monthly)
+    session: Session = Depends(get_session),
+):
+    # pick a file (latest if not specified)
+    q = select(FileRecord).where(FileRecord.dataset_id == dataset_id)
+    q = q.where(FileRecord.id == file_id) if file_id is not None else q.order_by(FileRecord.id.desc())
+    rec = session.exec(q).first()
+    if not rec:
+        raise HTTPException(status_code=404, detail="No files found for this dataset")
+
+    path = Path("/app") / rec.stored_path
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"File not found on disk: {rec.stored_path}")
+
+    try:
+        df = _read_csv_full(path)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read CSV: {e}")
+
+    # basic guards
+    if time_col not in df.columns:
+        raise HTTPException(status_code=400, detail=f"Time column '{time_col}' not found.")
+    if y not in df.columns:
+        raise HTTPException(status_code=400, detail=f"Y column '{y}' not found.")
+
+    # parse + clean
+    t = pd.to_datetime(df[time_col], errors="coerce", utc=True)
+    s = pd.to_numeric(df[y], errors="coerce")
+    sel = ~(t.isna() | s.isna())
+    ts = pd.DataFrame({"t": t[sel], "y": s[sel]}).sort_values("t").set_index("t")
+
+    if ts.empty:
+        raise HTTPException(status_code=400, detail="No valid (time, value) rows to plot.")
+
+    if resample:
+        try:
+            ts = ts.resample(resample).mean()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid resample rule (try 'D' or 'M').")
+
+    # plot
+    fig, ax = plt.subplots(figsize=(6, 3))
+    ax.plot(ts.index, ts["y"])
+    ax.set_xlabel(time_col)
+    ax.set_ylabel(y)
+    ax.set_title(f"{y} vs {time_col}")
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="image/png")
+
+# ---------- CSV export (select columns; optional row limit) ----------
+
+@app.get("/datasets/{dataset_id}/export")
+def export_dataset_csv(
+    dataset_id: int,
+    file_id: Optional[int] = None,
+    columns: Optional[str] = None,   # comma-separated list
+    limit: Optional[int] = None,
+    session: Session = Depends(get_session),
+):
+    q = select(FileRecord).where(FileRecord.dataset_id == dataset_id)
+    q = q.where(FileRecord.id == file_id) if file_id is not None else q.order_by(FileRecord.id.desc())
+    rec = session.exec(q).first()
+    if not rec:
+        raise HTTPException(status_code=404, detail="No files found for this dataset")
+
+    path = Path("/app") / rec.stored_path
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"File not found on disk: {rec.stored_path}")
+
+    try:
+        df = _read_csv_full(path)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read CSV: {e}")
+
+    if columns:
+        keep = [c.strip() for c in columns.split(",") if c.strip()]
+        missing = [c for c in keep if c not in df.columns]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Columns not found: {missing}")
+        df = df[keep]
+
+    if limit is not None:
+        try:
+            n = max(1, int(limit))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="limit must be an integer")
+        df = df.head(n)
+
+    # stream CSV
+    def _iter():
+        yield df.to_csv(index=False)
+
+    filename = Path(rec.original_name).with_suffix(".filtered.csv").name
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(_iter(), media_type="text/csv", headers=headers)
