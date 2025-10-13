@@ -7,3 +7,5 @@ python-multipart==0.0.9
 pandas==2.2.2
 chardet==5.2.0
 matplotlib==3.9.2
+redis==5.0.7
+rq==1.16.2
