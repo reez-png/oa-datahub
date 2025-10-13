@@ -61,5 +61,17 @@ services:
     volumes:
       - ./data:/app/data
 
+  frontend:
+    build: ./app/frontend
+    environment:
+      - NEXT_PUBLIC_API_BASE=http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    volumes:
+      - ./app/frontend:/app         # your source (hot-reload)
+      - /app/node_modules           # anonymous volume so deps persist
+
 volumes:
   dbdata:

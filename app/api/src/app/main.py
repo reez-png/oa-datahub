@@ -1,6 +1,7 @@
 # app/api/src/app/main.py
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 import os, io, csv
 import chardet
@@ -22,7 +23,17 @@ from rq import Queue
 from app.models import Job
 from app.db import create_db_and_tables, get_session
 
-app = FastAPI(title="OMI-OA DataHub API", version=os.getenv("APP_VERSION", "0.1.0"))
+# ---- FastAPI app + CORS ----
+app = FastAPI(title="OA DataHub API", version=os.getenv("APP_VERSION", "0.1.0"))
+
+# allow your local frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data/raw"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
