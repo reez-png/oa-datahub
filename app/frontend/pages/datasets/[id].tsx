@@ -23,7 +23,7 @@ function JobsPanel({ datasetId }: { datasetId?: string }) {
   const [polling, setPolling] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  // Simple auth flag from localStorage (safe on client only)
+  // Simple auth flag from localStorage (client-only)
   const isAuthed = typeof window !== "undefined" && !!localStorage.getItem("sb-access-token");
 
   const enqueue = async () => {
@@ -31,7 +31,7 @@ function JobsPanel({ datasetId }: { datasetId?: string }) {
     setErr(null);
     const url = `${API}/jobs?dataset_id=${datasetId}&y=${encodeURIComponent(y)}`;
 
-    // IMPORTANT: protected endpoint → use authFetch
+    // Protected endpoint → use authFetch
     const { authFetch } = await import("../../lib/auth");
     const r = await authFetch(url, { method: "POST" });
     const j = await r.json();
@@ -44,22 +44,36 @@ function JobsPanel({ datasetId }: { datasetId?: string }) {
     setPolling(true);
   };
 
-  // poll status
+  // Hardened poller (uses authFetch + try/catch, avoids UI crashes)
   useEffect(() => {
     if (!jobId || !polling) return;
+
     const t = setInterval(async () => {
-      const r = await fetch(`${API}/jobs/${jobId}`);
-      const j = await r.json();
-      if (r.ok) {
+      try {
+        const { authFetch } = await import("../../lib/auth");
+        const r = await authFetch(`${API}/jobs/${jobId}`);
+        if (!r.ok) {
+          // transient error: keep polling quietly
+          return;
+        }
+        const j = await r.json();
         setStatus(j.status || j.db?.status || "unknown");
         if (j?.db?.result_summary) {
           try {
             setSummary(JSON.parse(j.db.result_summary));
-          } catch {}
+          } catch {
+            /* ignore parse errors */
+          }
         }
-        if (["succeeded", "failed", "stopped"].includes(j.status)) setPolling(false);
+        if (["succeeded", "failed", "stopped"].includes(j.status)) {
+          setPolling(false);
+        }
+      } catch (e) {
+        // Network / CORS hiccup — keep polling quietly
+        console.warn("poll error", e);
       }
     }, 1500);
+
     return () => clearInterval(t);
   }, [jobId, polling]);
 
@@ -201,7 +215,7 @@ export default function DatasetPage() {
           (() => {
             const p = preview as any; // has .columns and .data
             return (
-              <div style={{ overflowX: "auto", border: "1px solid #ddd", borderRadius: 8 }}>
+              <div style={{ overflowX: "auto", border: "1px solid " + "#ddd", borderRadius: 8 }}>
                 <table style={{ borderCollapse: "collapse", width: "100%" }}>
                   <thead>
                     <tr>
@@ -242,7 +256,7 @@ export default function DatasetPage() {
         )}
       </section>
 
-      {/* ---- Jobs panel (protected enqueue) ---- */}
+      {/* ---- Jobs panel (protected enqueue + hardened poller) ---- */}
       <section style={{ marginBottom: 24 }}>
         <h3>Jobs</h3>
         <JobsPanel datasetId={id} />
