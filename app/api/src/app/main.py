@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 from redis import Redis
 from rq import Queue
 
-# Auth helper (expects you added this module)
+# Auth helper
 from app.auth import require_user
 
 # Models & DB helpers
@@ -174,6 +174,12 @@ def _normalize_columns(df: pd.DataFrame) -> dict:
                 mapping[canon] = lower[a.lower()]
                 break
     return mapping
+
+# ---------- Who am I ----------
+@app.get("/me")
+def me(session: Session = Depends(get_session), claims: dict = Depends(require_user)):
+    u = get_or_create_user(claims, session)
+    return {"email": u.email, "role": u.role, "sub": str(u.id)}
 
 # ---------- Dataset Endpoints ----------
 @app.get("/datasets", response_model=List[DatasetRead])

@@ -7,7 +7,7 @@ export async function authFetch(input: RequestInfo, init: RequestInit = {}) {
   if (token) {
     headers.set("Authorization", `Bearer ${token}`);
   } else {
-    // Dev convenience: used when API runs with AUTH_MODE=dev-noverify
+    // dev-only: lets API accept a fake user when AUTH_MODE=dev-noverify
     headers.set("x-dev-email", "dev@local.test");
   }
 
