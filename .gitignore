@@ -1,10 +1,13 @@
+# Env
+.env
+.env.local
+.env.*
+
 # Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.env
-.env.*
 .venv/
 venv/
 .envrc

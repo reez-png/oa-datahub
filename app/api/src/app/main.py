@@ -12,7 +12,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 
 from sqlmodel import SQLModel, Field, Session, select
-from datetime import date
+from datetime import date, datetime
+from uuid import UUID
 
 # Matplotlib (server-safe backend)
 import matplotlib as mpl
@@ -22,6 +23,9 @@ import matplotlib.pyplot as plt
 # RQ + Redis
 from redis import Redis
 from rq import Queue
+
+# Auth helper (expects you added this module)
+from app.auth import require_user
 
 # Models & DB helpers
 from app.models import Job
@@ -77,6 +81,31 @@ class FileRecord(SQLModel, table=True):
     original_name: str
     stored_path: str  # relative to /app (e.g., data/raw/1/file.csv)
     bytes: int
+
+# ---- Users table (Supabase-backed identities) ----
+class User(SQLModel, table=True):
+    id: UUID = Field(primary_key=True)            # Supabase auth user id
+    email: str
+    role: str = "viewer"                          # viewer | owner | admin
+    created_at: datetime | None = Field(default_factory=datetime.utcnow)
+
+def get_or_create_user(claims: dict, session: Session) -> User:
+    uid = claims.get("sub")
+    email = claims.get("email") or (claims.get("user_metadata") or {}).get("email")
+    if not uid or not email:
+        raise HTTPException(status_code=401, detail="Invalid token claims")
+    u = session.get(User, uid)
+    if not u:
+        # example ownership rule; adjust to your org
+        role = "owner" if email.endswith("@example.com") else "viewer"
+        u = User(id=UUID(uid), email=email, role=role)
+        session.add(u)
+        session.commit()
+    return u
+
+def require_role(user: User, *allowed: str):
+    if user.role not in allowed:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
 # ---------- Helpers ----------
 def _get_queue() -> Queue:
@@ -151,8 +180,16 @@ def _normalize_columns(df: pd.DataFrame) -> dict:
 def list_datasets(session: Session = Depends(get_session)):
     return session.exec(select(Dataset).order_by(Dataset.id)).all()
 
+# Protected: only owners/admins
 @app.post("/datasets", response_model=DatasetRead, status_code=201)
-def create_dataset(d: DatasetCreate, session: Session = Depends(get_session)):
+def create_dataset(
+    d: DatasetCreate,
+    session: Session = Depends(get_session),
+    claims: dict = Depends(require_user),
+):
+    user = get_or_create_user(claims, session)
+    require_role(user, "owner", "admin")
+
     item = Dataset(**d.model_dump())
     session.add(item)
     session.commit()
@@ -167,15 +204,25 @@ def get_dataset(dataset_id: int, session: Session = Depends(get_session)):
     return item
 
 @app.delete("/datasets/{dataset_id}", status_code=204)
-def delete_dataset(dataset_id: int, session: Session = Depends(get_session)):
+def delete_dataset(dataset_id: int, session: Session = Depends(get_session), claims: dict = Depends(require_user)):
+    user = get_or_create_user(claims, session)
+    require_role(user, "owner", "admin")
     item = session.get(Dataset, dataset_id)
     if item:
         session.delete(item)
         session.commit()
 
 # ---------- File Upload + List ----------
+# Auth required, any role
 @app.post("/datasets/{dataset_id}/files", response_model=dict, status_code=201)
-async def upload_file(dataset_id: int, f: UploadFile = File(...), session: Session = Depends(get_session)):
+async def upload_file(
+    dataset_id: int,
+    f: UploadFile = File(...),
+    session: Session = Depends(get_session),
+    claims: dict = Depends(require_user),
+):
+    _ = get_or_create_user(claims, session)  # ensure user exists; any role allowed
+
     ds = session.get(Dataset, dataset_id)
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
@@ -207,7 +254,6 @@ async def upload_file(dataset_id: int, f: UploadFile = File(...), session: Sessi
         "tip": "Saved under data/raw/<dataset_id>/ on your host.",
     }
 
-# >>>>>>> ADDED: list files endpoint <<<<<<<
 @app.get("/datasets/{dataset_id}/files", response_model=list[dict])
 def list_dataset_files(dataset_id: int, session: Session = Depends(get_session)):
     rows = session.exec(select(FileRecord).where(FileRecord.dataset_id == dataset_id)).all()
@@ -256,13 +302,17 @@ def preview_dataset(
     }
 
 # ---------- Jobs (enqueue + status) ----------
+# Auth required, any role
 @app.post("/jobs", response_model=dict, status_code=202)
 def create_job(
     dataset_id: int,
     file_id: int | None = None,
     y: str = "temperature",
     session: Session = Depends(get_session),
+    claims: dict = Depends(require_user),
 ):
+    _ = get_or_create_user(claims, session)  # any role
+
     q = select(FileRecord).where(FileRecord.dataset_id == dataset_id)
     q = q.where(FileRecord.id == file_id) if file_id else q.order_by(FileRecord.id.desc())
     rec = session.exec(q).first()

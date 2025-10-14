@@ -1,6 +1,7 @@
 import { useRouter } from "next/router";
 import { useEffect, useState } from "react";
 import dynamic from "next/dynamic";
+import { authFetch } from "../../lib/auth";
 
 const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
 const MapClient = dynamic(() => import("../../components/MapClient"), { ssr: false });
@@ -26,7 +27,8 @@ function JobsPanel({ datasetId }: { datasetId?: string }) {
     if (!datasetId) return;
     setErr(null);
     const url = `${API}/jobs?dataset_id=${datasetId}&y=${encodeURIComponent(y)}`;
-    const r = await fetch(url, { method: "POST" });
+    // Use authFetch for POST (protected)
+    const r = await authFetch(url, { method: "POST" });
     const j = await r.json();
     if (!r.ok) { setErr(j?.detail || `Failed (${r.status})`); return; }
     setJobId(j.job_id); setStatus(j.status); setPolling(true);

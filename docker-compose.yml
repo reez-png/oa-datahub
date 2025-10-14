@@ -1,5 +1,4 @@
-# docker-compose.yml
-# (You can remove the "version" line to silence the deprecation warning)
+version: "3.9"
 
 services:
   db:
@@ -25,13 +24,9 @@ services:
 
   api:
     build: ./app/api
-    environment:
-      - APP_VERSION=0.1.0
-      - PYTHONPATH=/app/src
-      - DATABASE_URL=postgresql+psycopg://appuser:apppass@db:5432/oadb
-      - DATA_DIR=/app/data/raw
-      - DATA_PROCESSED=/app/data/processed
-      - REDIS_URL=redis://redis:6379/0
+    env_file:
+      - .env
+      - .env.local
     depends_on:
       db:
         condition: service_healthy
@@ -44,34 +39,31 @@ services:
       - ./data:/app/data
 
   worker:
-    build: ./app/api      # reuse the same image (code + deps)
-    environment:
-      - PYTHONPATH=/app/src
-      - DATABASE_URL=postgresql+psycopg://appuser:apppass@db:5432/oadb
-      - DATA_DIR=/app/data/raw
-      - DATA_PROCESSED=/app/data/processed
-      - REDIS_URL=redis://redis:6379/0
+    build: ./app/api
+    env_file:
+      - .env
+      - .env.local
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_started
-    # Note: don't use ${REDIS_URL} here; Compose won't pull from the service env.
     command: rq worker -u redis://redis:6379/0 default
     volumes:
       - ./data:/app/data
 
   frontend:
     build: ./app/frontend
-    environment:
-      - NEXT_PUBLIC_API_BASE=http://localhost:8000
+    env_file:
+      - .env
+      - .env.local
     ports:
       - "3000:3000"
     depends_on:
       - api
     volumes:
-      - ./app/frontend:/app         # your source (hot-reload)
-      - /app/node_modules           # anonymous volume so deps persist
+      - ./app/frontend:/app
+      - /app/node_modules
 
 volumes:
   dbdata:
